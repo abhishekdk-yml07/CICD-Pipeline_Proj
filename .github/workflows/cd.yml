@@ -1,0 +1,205 @@
+name: CD — Build, Push, Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: staging
+        type: choice
+        options: [staging, prod]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.semver.outputs.version }}
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate semantic version
+        id: semver
+        run: |
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          COMMITS=$(git rev-list ${TAG}..HEAD --count)
+          SHA=$(git rev-parse --short HEAD)
+          VERSION="${TAG#v}.${COMMITS}-${SHA}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=${{ steps.semver.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ steps.semver.outputs.version }}
+            BUILD_DATE=${{ github.run_id }}
+
+      - name: Run Trivy scan (built image digest)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment:
+      name: staging
+      url: https://staging.myapp.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Deploy (Helm)
+        run: |
+          helm upgrade --install myapp ./helm/myapp \
+            --namespace staging \
+            --create-namespace \
+            --set image.tag=${{ needs.build-and-push.outputs.version }} \
+            --atomic \
+            --timeout 5m \
+            --wait
+
+      - name: Smoke tests
+        run: |
+          curl -f https://staging.myapp.com/health
+          curl -f https://staging.myapp.com/api/v1/status
+
+
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-staging]
+    environment:
+      name: production
+      url: https://myapp.com
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Deploy Canary (20%)
+        run: |
+          helm upgrade --install myapp ./helm/myapp \
+            --namespace production \
+            --create-namespace \
+            --set image.tag=${{ needs.build-and-push.outputs.version }} \
+            --set canary.enabled=true \
+            --set canary.weight=20 \
+            --atomic \
+            --timeout 10m \
+            --wait
+
+      - name: Validate Canary (safe check)
+        run: |
+          sleep 120
+
+          ERROR_RATE=$(curl -s "https://prometheus.myapp.com/api/v1/query?query=rate(http_requests_total{status=~'5..'}[2m])" \
+            | jq -r '.data.result[0].value[1] // "0"')
+
+          echo "Error rate: $ERROR_RATE"
+
+          if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+            echo "High error rate — rolling back"
+            helm rollback myapp 1 -n production
+            exit 1
+          fi
+
+      - name: Promote to 100%
+        run: |
+          helm upgrade myapp ./helm/myapp \
+            --namespace production \
+            --set image.tag=${{ needs.build-and-push.outputs.version }} \
+            --set canary.enabled=false \
+            --atomic \
+            --timeout 10m \
+            --wait
+
+      - name: Slack Success
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "Production deployment successful",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  {"title": "Version", "value": "${{ needs.build-and-push.outputs.version }}", "short": true},
+                  {"title": "Actor", "value": "${{ github.actor }}", "short": true}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
